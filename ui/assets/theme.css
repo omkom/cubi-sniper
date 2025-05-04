@@ -1,0 +1,18 @@
+@import url('https://rsms.me/inter/inter.css');
+
+:root {
+  --bg: #0f0f0f;
+  --text: #ffffff;
+  --accent: #ffb300;
+  --success: #00c48c;
+  --error: #ff4d4d;
+  --border: #1f1f1f;
+  font-family: 'Inter', sans-serif;
+}
+
+body {
+  background-color: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  margin: 0;
+}

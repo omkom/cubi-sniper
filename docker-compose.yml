@@ -1,0 +1,59 @@
+version: "3.8"
+
+services:
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    container_name: backend
+    depends_on:
+      - redis
+    ports:
+      - "4000:4000"
+    environment:
+      - REDIS_URL=redis://redis:6379
+    volumes:
+      - ./backend:/app
+    restart: unless-stopped
+
+  ui:
+    build: ./ui
+    container_name: ui
+    depends_on:
+      - backend
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./ui:/app
+    environment:
+      - VITE_API_BASE=http://localhost:4000
+    restart: unless-stopped
+
+  ai_model:
+    build: ./ai_model
+    container_name: ai_model
+    volumes:
+      - ./ai_model:/app
+      - model_data:/app/models
+    command: tail -f /dev/null
+    restart: unless-stopped
+
+  ocaml_engine:
+    build: ./ocaml_engine
+    container_name: ocaml_engine
+    volumes:
+      - ./ocaml_engine:/app
+    command: tail -f /dev/null
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  model_data:

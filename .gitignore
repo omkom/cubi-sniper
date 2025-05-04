@@ -1,0 +1,50 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-error.log
+pnpm-lock.yaml
+*-lock.json
+
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env/
+*.env
+.venv/
+venv/
+pip-log.txt
+
+# Vite / Vue
+dist/
+.vite/
+*.local
+
+# TypeScript
+*.tsbuildinfo
+
+# Docker
+*.log
+docker-compose.override.yml
+.env.local
+
+# AI/Model files
+ai_model/*.joblib
+ai_model/*.pkl
+ai_model/__pycache__/
+
+# Build artifacts
+build/
+coverage/
+*.tgz
+
+# VSCode / IDE
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# OS stuff
+Thumbs.db
+ehthumbs.db

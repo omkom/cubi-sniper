@@ -1,0 +1,18 @@
+# Normalisation des fins de ligne
+* text=auto eol=lf
+
+# Forcer UTF-8 pour tous les fichiers texte
+*.ts     text eol=lf
+*.js     text eol=lf
+*.vue    text eol=lf
+*.py     text eol=lf
+*.md     text eol=lf
+*.json   text eol=lf
+*.yml    text eol=lf
+*.sh     text eol=lf
+
+# Traiter les images comme binaires
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
