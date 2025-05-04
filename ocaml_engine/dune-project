@@ -7,6 +7,4 @@
  (depends
   dune
   yojson
-  ocaml (>= "4.14")))
-
-(cram enable)
+  ocaml))
