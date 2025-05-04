@@ -1,5 +1,15 @@
 version: "3.8"
 
+volumes:
+  redis_data:
+  model_data:
+  postgres_data:
+  training_data:
+
+networks:
+  internal:
+    driver: bridge
+
 services:
 
   redis:
@@ -7,21 +17,56 @@ services:
     container_name: redis
     volumes:
       - redis_data:/data
-    ports:
-      - "6379:6379"
+    networks:
+      - internal
     restart: unless-stopped
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-cubi}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - internal
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   backend:
     build: ./backend
     container_name: backend
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
     ports:
-      - "4000:4000"
+      - "${API_PORT:-4000}:${API_PORT:-4000}"
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - POSTGRES_URL=${POSTGRES_URL:-postgresql://postgres:postgres@postgres:5432/cubi}
+      - API_PORT=${API_PORT:-4000}
+      - WS_PORT=${WS_PORT:-3010}
+      - CORS_ORIGIN=${CORS_ORIGIN:-*}
+      - NODE_ENV=${NODE_ENV:-development}
     volumes:
       - ./backend:/app
+      - /app/node_modules
+    networks:
+      - internal
     restart: unless-stopped
 
   ui:
@@ -30,30 +75,131 @@ services:
     depends_on:
       - backend
     ports:
-      - "3000:3000"
+      - "${UI_PORT:-3000}:${UI_PORT:-3000}"
     volumes:
       - ./ui:/app
+      - /app/node_modules
     environment:
-      - VITE_API_BASE=http://localhost:4000
+      - VITE_API_BASE=http://localhost:${API_PORT:-4000}
+      - VITE_WS_BASE=ws://localhost:${WS_PORT:-3010}
+      - UI_PORT=${UI_PORT:-3000}
+    networks:
+      - internal
     restart: unless-stopped
 
   ai_model:
     build: ./ai_model
     container_name: ai_model
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     volumes:
       - ./ai_model:/app
       - model_data:/app/models
-    command: tail -f /dev/null
+      - training_data:/app/training_data
+    environment:
+      - AI_PORT=${AI_PORT:-8000}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - POSTGRES_URL=${POSTGRES_URL:-postgresql://postgres:postgres@postgres:5432/cubi}
+      - TRAINING_DATA_PATH=/app/training_data/training_data.jsonl
+    networks:
+      - internal
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  data_collector:
+    build: 
+      context: ./ai_model
+      dockerfile: Dockerfile
+      target: collector
+    container_name: data_collector
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - POSTGRES_URL=${POSTGRES_URL:-postgresql://postgres:postgres@postgres:5432/cubi}
+      - JUPITER_API_URL=${JUPITER_API_URL:-https://quote-api.jup.ag/v6}
+    volumes:
+      - training_data:/app/training_data
+    networks:
+      - internal
+    restart: unless-stopped
+    # Collecte données toutes les heures
+    command: python data_collector.py --schedule hourly
 
   ocaml_engine:
     build: ./ocaml_engine
     container_name: ocaml_engine
     volumes:
-      - ./ocaml_engine:/app
-    command: tail -f /dev/null
+      - ./ocaml_engine:/home/opam/app
+    environment:
+      - PORT=${OCAML_PORT:-8080}
+    networks:
+      - internal
     restart: unless-stopped
 
-volumes:
-  redis_data:
-  model_data:
+  solana_agent:
+    build: ./solana_agent
+    container_name: solana_agent
+    depends_on:
+      - redis
+      - ai_model
+      - ocaml_engine
+    environment:
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - AI_MODEL_URL=http://ai_model:${AI_PORT:-8000}
+      - EXIT_MODEL_URL=http://ai_model:${AI_PORT:-8000}/exit
+      - OCAML_API_URL=http://ocaml_engine:${OCAML_PORT:-8080}/score
+      - LIVE_MODE=${LIVE_MODE:-false}
+      - WALLET_KEYPAIR_PATH=/app/wallet/wallet.json
+      - API_BASE_URL=http://backend:${API_PORT:-4000}
+      - CREATOR_WALLET=${CREATOR_WALLET}
+      - SOLANA_RPC_URL=${SOLANA_RPC_URL:-https://api.mainnet-beta.solana.com}
+      - DOCKER_CONTAINER=true
+    volumes:
+      - ./wallet:/app/wallet:ro
+      - ./solana_agent:/app
+      - /app/node_modules
+    networks:
+      - internal
+    restart: unless-stopped
+
+  market_watcher:
+    build: ./market_watcher
+    container_name: market_watcher
+    depends_on:
+      - redis
+    environment:
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - JUPITER_API_URL=${JUPITER_API_URL:-https://quote-api.jup.ag/v6}
+    volumes:
+      - ./market_watcher:/app
+      - /app/node_modules
+    networks:
+      - internal
+    restart: unless-stopped
+
+  cron_scheduler:
+    image: crazymax/swarm-cronjob:latest
+    container_name: cron_scheduler
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - LOG_LEVEL=info
+      - LOG_JSON=false
+    labels:
+      - "swarm.cronjob.enable=true"
+      - "swarm.cronjob.schedule=0 3 * * *"
+      - "swarm.cronjob.command=docker exec ai_model python train.sh"
+    networks:
+      - internal
+    restart: unless-stopped

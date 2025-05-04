@@ -1,0 +1,38 @@
+# Production Market Watcher Dockerfile
+FROM node:20-alpine as builder
+
+WORKDIR /app
+
+# Installer les dépendances de build
+RUN apk add --no-cache python3 make g++
+
+# Copier package files
+COPY package*.json ./
+
+# Installer les dépendances
+RUN npm ci
+
+# Copier le code source
+COPY src ./src
+
+# Build le projet si nécessaire
+# RUN npm run build
+
+# Stage de production
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Copier les dépendances de production
+COPY --from=builder /app/package*.json ./
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/src ./src
+
+# Créer un utilisateur non-root
+RUN adduser -D -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+# Variables d'environnement
+ENV NODE_ENV=production
+
+CMD ["ts-node", "src/marketWatcher.ts"]

@@ -1,0 +1,42 @@
+# Production Solana Agent Dockerfile
+FROM node:20-alpine as builder
+
+WORKDIR /app
+
+# Installer les dépendances de build
+RUN apk add --no-cache python3 make g++
+
+# Copier package files
+COPY package*.json ./
+COPY tsconfig.json ./
+
+# Installer les dépendances
+RUN npm ci
+
+# Copier le code source
+COPY src ./src
+COPY scripts ./scripts
+COPY strategies ./strategies
+
+# Build le projet
+RUN npm run build
+
+# Stage de production
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Copier les dépendances de production
+COPY --from=builder /app/package*.json ./
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/strategies ./strategies
+
+# Créer un utilisateur non-root
+RUN adduser -D -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+# Variables d'environnement
+ENV NODE_ENV=production
+
+CMD ["node", "dist/src/agent.js"]

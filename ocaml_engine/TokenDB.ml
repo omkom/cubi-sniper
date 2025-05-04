@@ -44,12 +44,26 @@ let score t w =
   (l +. h +. a +. v +. r) /. (w.w_liquidity +. w.w_holders +. w.w_ai_score +. w.w_volatility +. w.w_buy_sell_ratio)
 
 let () =
-  let input = Yojson.Basic.from_file "input.json" in
-  let t = parse_token input in
-  let w =
-    if Sys.file_exists "weights.json"
-    then parse_weights (Yojson.Basic.from_file "weights.json")
-    else { w_liquidity = 1.0; w_holders = 1.0; w_ai_score = 1.0; w_volatility = 1.0; w_buy_sell_ratio = 1.0 }
-  in
-  let s = score t w in
-  Printf.printf "{\"score\": %.3f}\n" s
+  let input_path = if Array.length Sys.argv > 1 then Sys.argv.(1) else "input.json" in
+  let weights_path = if Array.length Sys.argv > 2 then Sys.argv.(2) else "weights.json" in
+  
+  try
+    let input = Yojson.Basic.from_file input_path in
+    let t = parse_token input in
+    let w =
+      if Sys.file_exists weights_path
+      then parse_weights (Yojson.Basic.from_file weights_path)
+      else { w_liquidity = 1.0; w_holders = 1.0; w_ai_score = 1.0; w_volatility = 1.0; w_buy_sell_ratio = 1.0 }
+    in
+    let s = score t w in
+    Printf.printf "{\"score\": %.3f}\n" s
+  with
+  | Yojson.Json_error msg ->
+      Printf.eprintf "JSON parsing error: %s\n" msg;
+      exit 1
+  | Sys_error msg ->
+      Printf.eprintf "File error: %s\n" msg;
+      exit 1
+  | e ->
+      Printf.eprintf "Error: %s\n" (Printexc.to_string e);
+      exit 1

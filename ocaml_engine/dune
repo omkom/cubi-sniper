@@ -1,0 +1,4 @@
+(executable
+ (public_name tokendb)
+ (name TokenDB)
+ (libraries yojson))

@@ -1,0 +1,19 @@
+# OCaml build artifacts
+_build/
+*.install
+
+# Input/output files used for testing
+input.json
+weights.json
+output.json
+
+# Editor stuff
+.merlin
+.ocamlinit
+*.swp
+
+# Compiled binaries
+*.exe
+*.opt
+*.native
+*.byte

@@ -1,5 +1,6 @@
 import { createRouter, createWebHistory } from 'vue-router'
 
+// Routes principales
 import God from '../pages/God.vue'
 import Train from '../pages/Train.vue'
 import Account from '../pages/Account.vue'
@@ -22,7 +23,7 @@ const routes = [
 ]
 
 const router = createRouter({
-  history: createWebHistory(),
+  history: createWebHistory(import.meta.env.BASE_URL),
   routes
 })
 

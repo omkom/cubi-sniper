@@ -1,0 +1,40 @@
+# Production Backend Dockerfile
+FROM node:18-alpine as builder
+
+WORKDIR /app
+
+# Installer les dépendances de build
+RUN apk add --no-cache python3 make g++
+
+# Copier package files
+COPY package*.json ./
+
+# Installer les dépendances
+RUN npm ci --only=production
+
+# Copier le code
+COPY . .
+
+# Build l'application (si nécessaire)
+# RUN npm run build
+
+# Stage de production
+FROM node:18-alpine
+
+WORKDIR /app
+
+# Copier les dépendances de production
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/package*.json ./
+COPY --from=builder /app/*.js ./
+COPY --from=builder /app/routes ./routes
+COPY --from=builder /app/lib ./lib
+
+# Créer un utilisateur non-root
+RUN adduser -D -u 1000 appuser
+USER appuser
+
+EXPOSE 4000
+EXPOSE 3010
+
+CMD ["node", "server.js"]

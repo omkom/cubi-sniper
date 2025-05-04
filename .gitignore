@@ -1,3 +1,8 @@
+# Environment files
+.env
+.env.*
+!.env.example
+
 # Node
 node_modules/
 npm-debug.log*
@@ -5,13 +10,11 @@ yarn-error.log
 pnpm-lock.yaml
 *-lock.json
 
-
 # Python
 __pycache__/
 *.py[cod]
 *.pyo
 .env/
-*.env
 .venv/
 venv/
 pip-log.txt
@@ -33,6 +36,8 @@ docker-compose.override.yml
 ai_model/*.joblib
 ai_model/*.pkl
 ai_model/__pycache__/
+ai_model/training_data.jsonl
+ai_model/models/
 
 # Build artifacts
 build/
@@ -48,3 +53,24 @@ coverage/
 # OS stuff
 Thumbs.db
 ehthumbs.db
+
+# Wallet keys (Security)
+wallet/*.json
+!wallet/test_keypair.json
+wallet.json
+
+# Redis data
+redis_data/
+*.rdb
+
+# Logs
+logs/
+*.log
+
+# Temporary files
+tmp/
+temp/
+
+# Generated files
+generated/
+strategies_leaderboard.json
