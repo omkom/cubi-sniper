@@ -1,0 +1,21 @@
+{
+    "name": "cubi-sniper-market-watcher",
+    "version": "1.0.0",
+    "description": "Market watcher for Cubi-sniper",
+    "main": "src/marketWatcher.ts",
+    "scripts": {
+      "start": "ts-node src/marketWatcher.ts",
+      "dev": "nodemon --exec ts-node src/marketWatcher.ts"
+    },
+    "dependencies": {
+      "ioredis": "^5.6.1",
+      "node-fetch": "^3.3.2",
+      "dotenv": "^16.0.3"
+    },
+    "devDependencies": {
+      "@types/node": "^20.11.19",
+      "typescript": "^5.2.2",
+      "ts-node": "^10.9.2",
+      "nodemon": "^3.1.10"
+    }
+  }

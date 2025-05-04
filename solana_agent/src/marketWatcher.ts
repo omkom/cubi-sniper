@@ -8,16 +8,43 @@ const JUPITER_TOKENS_URL = 'https://quote-api.jup.ag/v6/tokens';
 const SEED_INTERVAL = 15_000; // 15 sec
 const BASE_TOKEN = 'So11111111111111111111111111111111111111112'; // SOL
 
-async function getPools() {
-  const res = await fetch(`${JUPITER_POOLS_URL}?inputMint=${BASE_TOKEN}`);
-  const data = await res.json();
-  return data;
+interface JupiterPool {
+  inputMint: string;
+  outputMint: string;
+  outputSymbol?: string;
+  liquidity?: number;
+  volume?: number;
+  swapFeeBps: number;
+  txRate?: number;
+  priceImpactPct?: number;
 }
 
-async function enrichAndStore(pool: any) {
+interface TokenFeatures {
+  mint: string;
+  symbol: string;
+  liquidity: number;
+  volume: number;
+  swapFee: number;
+  txRate: number;
+  impact: number;
+  detected_at: number;
+}
+
+async function getPools(): Promise<JupiterPool[]> {
+  try {
+    const res = await fetch(`${JUPITER_POOLS_URL}?inputMint=${BASE_TOKEN}`);
+    const data = await res.json();
+    return data;
+  } catch (error) {
+    console.error('Erreur lors de la récupération des pools:', error);
+    return [];
+  }
+}
+
+async function enrichAndStore(pool: JupiterPool): Promise<void> {
   const token = pool.outputMint;
   const name = pool.outputSymbol || token.slice(0, 6);
-  const features = {
+  const features: TokenFeatures = {
     mint: token,
     symbol: name,
     liquidity: pool.liquidity || 0,
@@ -38,9 +65,14 @@ async function enrichAndStore(pool: any) {
 }
 
 async function main() {
+  console.log('🔍 Market Watcher démarré...');
+  console.log(`Scanner Jupiter Aggregator toutes les ${SEED_INTERVAL / 1000}s`);
+  
   while (true) {
     try {
       const pools = await getPools();
+      console.log(`Vérifié ${pools.length} pools...`);
+      
       for (const pool of pools) {
         if (pool.outputMint && pool.outputMint !== BASE_TOKEN) {
           await enrichAndStore(pool);
@@ -52,5 +84,18 @@ async function main() {
     await new Promise((r) => setTimeout(r, SEED_INTERVAL));
   }
 }
+
+// Gestion propre des interruptions
+process.on('SIGTERM', async () => {
+  console.log('🛑 Arrêt du Market Watcher...');
+  await redis.quit();
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('🛑 Arrêt du Market Watcher...');
+  await redis.quit();
+  process.exit(0);
+});
 
 main();
