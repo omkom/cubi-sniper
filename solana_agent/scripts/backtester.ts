@@ -2,9 +2,9 @@
 import fs from 'fs';
 import path from 'path';
 import { manualStrategies } from '../strategies/manual/manualAll';
-import { Strategy } from '../types';
-import { runStrategySimulation } from '../engine/simulator';
-import { trackStrategyResult } from '../strategyTracker';
+import { Strategy } from '../src/types';
+import { runStrategySimulation } from '../src/engine/simulator';
+import { trackStrategyResult, getStrategyStats } from '../src/strategyTracker';
 
 const TOKENS_DIR = './datasets/';
 const OUTPUT_FILE = 'training_data.jsonl';
@@ -37,8 +37,7 @@ async function backtestAll() {
 }
 
 async function generateLeaderboard() {
-  const raw = await import('../strategyTracker');
-  const all = await raw.getStrategyStats();
+  const all = await getStrategyStats();
   return Object.entries(all).map(([id, stats]) => ({ id, ...stats }))
     .sort((a, b) => b.roi_avg - a.roi_avg);
 }
