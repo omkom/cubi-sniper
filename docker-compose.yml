@@ -24,7 +24,7 @@ services:
     volumes:
       - redis_data:/data
       - ./redis/redis.conf:/usr/local/etc/redis/redis.conf
-    command: redis-server /usr/local/etc/redis/redis.conf --appendonly yes
+    command: redis-server /usr/local/etc/redis/redis.conf
     networks:
       - internal
     restart: unless-stopped
@@ -157,19 +157,26 @@ services:
     container_name: ocaml_engine
     environment:
       - PORT=${OCAML_PORT:-8080}
+    volumes:
+      - ./ocaml_engine:/home/opam/app
+    # Create a default input.json file on startup to prevent errors
+    command: >
+      sh -c "echo '{\"liquidity\": 10.0, \"holders\": 50, \"ai_score\": 0.8, \"volatility_1m\": 0.2, \"buy_sell_ratio\": 1.5}' > /home/opam/app/input.json &&
+             cd /home/opam/app && eval $$(opam env) && exec dune exec ./TokenDB.exe"
     networks:
       - internal
     restart: unless-stopped
-    volumes:
-      - ./ocaml_engine:/home/opam/app
 
   solana_agent:
     build: ./solana_agent
     container_name: solana_agent
     depends_on:
-      - redis
-      - ai_model
-      - ocaml_engine
+      redis:
+        condition: service_healthy
+      ai_model:
+        condition: service_started
+      ocaml_engine:
+        condition: service_started
     environment:
       - REDIS_URL=${REDIS_URL:-redis://redis:6379}
       - AI_MODEL_URL=http://ai_model:${AI_PORT:-8000}
@@ -193,7 +200,8 @@ services:
     build: ./market_watcher
     container_name: market_watcher
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     environment:
       - REDIS_URL=${REDIS_URL:-redis://redis:6379}
       - JUPITER_API_URL=${JUPITER_API_URL:-https://quote-api.jup.ag/v4}
@@ -208,8 +216,10 @@ services:
     image: debian:bullseye-slim
     container_name: backup_service
     depends_on:
-      - redis
-      - postgres
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
     volumes:
       - redis_data:/data/redis:ro
       - postgres_data:/data/postgres:ro
