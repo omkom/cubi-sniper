@@ -1,4 +1,4 @@
-// Scan Jupiter for détecter les tokens
+// Scan Jupiter pour détecter les tokens
 import fetch from 'node-fetch';
 import Redis from 'ioredis';
 
@@ -33,7 +33,7 @@ interface TokenFeatures {
 async function getPools(): Promise<JupiterPool[]> {
   try {
     const res = await fetch(`${JUPITER_POOLS_URL}?inputMint=${BASE_TOKEN}`);
-    const data = await res.json() as JupiterPool[]; // Add type assertion here
+    const data = await res.json() as JupiterPool[];
     return data;
   } catch (error) {
     console.error('Erreur lors de la récupération des pools:', error);
@@ -57,17 +57,48 @@ async function enrichAndStore(pool: JupiterPool): Promise<void> {
 
   const key = `token:${token}`;
   const exists = await redis.exists(key);
+  
   if (!exists) {
     console.log(`[+] Nouveau pool : ${name} (${token})`);
-    // Fix for Redis JSON commands
-    await redis.call('JSON.SET', key, '$', JSON.stringify(features));
-    await redis.zadd('pools', Date.now(), token); // log chronologique
+    
+    // Stocker les données en tant que JSON stringifié
+    await redis.set(key, JSON.stringify(features));
+    
+    // Annoncer le nouveau token sur le canal dedicated
+    redis.publish('new_token', token);
+    
+    // Ajouter à la liste chronologique
+    await redis.zadd('pools', Date.now(), token);
+  }
+}
+
+// Fonction auxiliaire pour obtenir des données JSON depuis Redis
+async function getTokenData(token: string): Promise<TokenFeatures | null> {
+  try {
+    const key = `token:${token}`;
+    const jsonStr = await redis.get(key);
+    
+    if (!jsonStr) return null;
+    
+    return JSON.parse(jsonStr) as TokenFeatures;
+  } catch (error) {
+    console.error(`Erreur lors de la récupération du token ${token}:`, error);
+    return null;
   }
 }
 
 async function main() {
   console.log('🔍 Market Watcher démarré...');
   console.log(`Scanner Jupiter Aggregator toutes les ${SEED_INTERVAL / 1000}s`);
+  
+  // Vérifier si Redis est accessible
+  try {
+    await redis.ping();
+    console.log('✅ Connexion Redis établie');
+  } catch (error) {
+    console.error('❌ Erreur de connexion Redis:', error);
+    process.exit(1);
+  }
   
   while (true) {
     try {
@@ -86,26 +117,6 @@ async function main() {
   }
 }
 
-
-async function redisJsonSet(redis, key, path, jsonData) {
-  // Store JSON as a string in Redis
-  const jsonString = typeof jsonData === 'string' ? jsonData : JSON.stringify(jsonData);
-  return redis.set(key, jsonString);
-}
-
-async function redisJsonGet(redis, key, path = '$') {
-  // Retrieve JSON string from Redis 
-  const jsonString = await redis.get(key);
-  if (!jsonString) return null;
-  
-  try {
-    return JSON.parse(jsonString);
-  } catch (error) {
-    console.error(`Error parsing JSON from Redis key ${key}:`, error);
-    return null;
-  }
-}
-
 // Gestion propre des interruptions
 process.on('SIGTERM', async () => {
   console.log('🛑 Arrêt du Market Watcher...');
@@ -119,4 +130,7 @@ process.on('SIGINT', async () => {
   process.exit(0);
 });
 
-main();
+main().catch(error => {
+  console.error('Fatal error in market watcher:', error);
+  process.exit(1);
+});

@@ -2,9 +2,15 @@ version: "3.8"
 
 volumes:
   redis_data:
+    driver: local
   model_data:
+    driver: local
   postgres_data:
+    driver: local
   training_data:
+    driver: local
+  backup_data:
+    driver: local
 
 networks:
   internal:
@@ -13,14 +19,15 @@ networks:
 services:
 
   redis:
-    image: redislabs/rejson:latest
+    image: redis:7-alpine
     container_name: redis
     volumes:
       - redis_data:/data
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf
+    command: redis-server /usr/local/etc/redis/redis.conf --appendonly yes
     networks:
       - internal
     restart: unless-stopped
-    command: redis-server --appendonly yes
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -37,6 +44,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./backend/scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+      - ./backend/scripts:/scripts
     networks:
       - internal
     restart: unless-stopped
@@ -56,6 +64,7 @@ services:
         condition: service_healthy
     ports:
       - "${API_PORT:-4000}:${API_PORT:-4000}"
+      - "${WS_PORT:-3010}:${WS_PORT:-3010}"
     environment:
       - REDIS_URL=${REDIS_URL:-redis://redis:6379}
       - POSTGRES_URL=${POSTGRES_URL:-postgresql://postgres:postgres@postgres:5432/cubi}
@@ -64,6 +73,7 @@ services:
       - CORS_ORIGIN=${CORS_ORIGIN:-*}
       - NODE_ENV=${NODE_ENV:-development}
     volumes:
+      - ./wallet:/app/wallet:ro
       - ./backend:/app
       - /app/node_modules
     networks:
@@ -100,6 +110,8 @@ services:
       - ./ai_model:/app
       - model_data:/app/models
       - training_data:/app/training_data
+    ports:
+      - "${AI_PORT:-8000}:${AI_PORT:-8000}"
     environment:
       - AI_PORT=${AI_PORT:-8000}
       - REDIS_URL=${REDIS_URL:-redis://redis:6379}
@@ -129,13 +141,16 @@ services:
       - REDIS_URL=${REDIS_URL:-redis://redis:6379}
       - POSTGRES_URL=${POSTGRES_URL:-postgresql://postgres:postgres@postgres:5432/cubi}
       - JUPITER_API_URL=${JUPITER_API_URL:-https://quote-api.jup.ag/v4}
+      - TRAINING_DATA_PATH=/app/training_data/training_data.jsonl
     volumes:
       - training_data:/app/training_data
+      - ./ai_model:/app
+      - backup_data:/app/backup
     networks:
       - internal
     restart: unless-stopped
     # Collecte données toutes les heures
-    command: python data_collector.py --schedule hourly
+    command: python data_collector.py --schedule hourly --mode full
 
   ocaml_engine:
     build: ./ocaml_engine
@@ -145,9 +160,8 @@ services:
     networks:
       - internal
     restart: unless-stopped
-    # Use this if volumes are causing issues
-    # volumes:
-    #   - ./ocaml_engine:/home/opam/app 
+    volumes:
+      - ./ocaml_engine:/home/opam/app
 
   solana_agent:
     build: ./solana_agent
@@ -190,19 +204,25 @@ services:
       - internal
     restart: unless-stopped
 
-  # Disabled until Docker swarm is configured
-  # cron_scheduler:
-  #   image: crazymax/swarm-cronjob:latest
-  #   container_name: cron_scheduler
-  #   volumes:
-  #     - /var/run/docker.sock:/var/run/docker.sock
-  #   environment:
-  #     - LOG_LEVEL=info
-  #     - LOG_JSON=false
-  #   labels:
-  #     - "swarm.cronjob.enable=true"
-  #     - "swarm.cronjob.schedule=0 3 * * *"
-  #     - "swarm.cronjob.command=docker exec ai_model python train.sh"
-  #   networks:
-  #     - internal
-  #   restart: unless-stopped
+  backup_service:
+    image: debian:bullseye-slim
+    container_name: backup_service
+    depends_on:
+      - redis
+      - postgres
+    volumes:
+      - redis_data:/data/redis:ro
+      - postgres_data:/data/postgres:ro
+      - training_data:/data/training:ro
+      - model_data:/data/models:ro
+      - backup_data:/backup
+      - ./scripts/backup.sh:/backup.sh
+    environment:
+      - BACKUP_INTERVAL=${BACKUP_INTERVAL:-86400}  # 24 heures par défaut
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - POSTGRES_DB=${POSTGRES_DB:-cubi}
+    command: bash -c "apt-get update && apt-get install -y cron postgresql-client redis-tools && chmod +x /backup.sh && /backup.sh"
+    networks:
+      - internal
+    restart: unless-stopped
