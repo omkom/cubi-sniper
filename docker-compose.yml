@@ -13,7 +13,7 @@ networks:
 services:
 
   redis:
-    image: redis:7-alpine
+    image: redislabs/rejson:latest
     container_name: redis
     volumes:
       - redis_data:/data
@@ -36,6 +36,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-cubi}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./backend/scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
     networks:
       - internal
     restart: unless-stopped
@@ -127,7 +128,7 @@ services:
     environment:
       - REDIS_URL=${REDIS_URL:-redis://redis:6379}
       - POSTGRES_URL=${POSTGRES_URL:-postgresql://postgres:postgres@postgres:5432/cubi}
-      - JUPITER_API_URL=${JUPITER_API_URL:-https://quote-api.jup.ag/v6}
+      - JUPITER_API_URL=${JUPITER_API_URL:-https://quote-api.jup.ag/v4}
     volumes:
       - training_data:/app/training_data
     networks:
@@ -139,13 +140,14 @@ services:
   ocaml_engine:
     build: ./ocaml_engine
     container_name: ocaml_engine
-    volumes:
-      - ./ocaml_engine:/home/opam/app
     environment:
       - PORT=${OCAML_PORT:-8080}
     networks:
       - internal
     restart: unless-stopped
+    # Use this if volumes are causing issues
+    # volumes:
+    #   - ./ocaml_engine:/home/opam/app 
 
   solana_agent:
     build: ./solana_agent
@@ -180,7 +182,7 @@ services:
       - redis
     environment:
       - REDIS_URL=${REDIS_URL:-redis://redis:6379}
-      - JUPITER_API_URL=${JUPITER_API_URL:-https://quote-api.jup.ag/v6}
+      - JUPITER_API_URL=${JUPITER_API_URL:-https://quote-api.jup.ag/v4}
     volumes:
       - ./market_watcher:/app
       - /app/node_modules
@@ -188,18 +190,19 @@ services:
       - internal
     restart: unless-stopped
 
-  cron_scheduler:
-    image: crazymax/swarm-cronjob:latest
-    container_name: cron_scheduler
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    environment:
-      - LOG_LEVEL=info
-      - LOG_JSON=false
-    labels:
-      - "swarm.cronjob.enable=true"
-      - "swarm.cronjob.schedule=0 3 * * *"
-      - "swarm.cronjob.command=docker exec ai_model python train.sh"
-    networks:
-      - internal
-    restart: unless-stopped
+  # Disabled until Docker swarm is configured
+  # cron_scheduler:
+  #   image: crazymax/swarm-cronjob:latest
+  #   container_name: cron_scheduler
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #   environment:
+  #     - LOG_LEVEL=info
+  #     - LOG_JSON=false
+  #   labels:
+  #     - "swarm.cronjob.enable=true"
+  #     - "swarm.cronjob.schedule=0 3 * * *"
+  #     - "swarm.cronjob.command=docker exec ai_model python train.sh"
+  #   networks:
+  #     - internal
+  #   restart: unless-stopped

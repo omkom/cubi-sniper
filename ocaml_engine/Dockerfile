@@ -11,17 +11,15 @@ WORKDIR /home/opam/app
 # Copier le code OCaml
 COPY --chown=opam:opam . .
  
-# Installer les dépendances OCaml
+# Installer les dépendances OCaml et compiler
 RUN opam install yojson dune --yes
-
-# Compiler le projet
 RUN eval $(opam env) && dune build
 
-# Créer un script wrapper pour l'exécution
+# Create the run.sh script properly
 RUN echo '#!/bin/sh\neval $(opam env)\nexec dune exec ./TokenDB.exe "$@"' > run.sh && chmod +x run.sh
 
 # Exposer le volume pour les fichiers partagés
 VOLUME /home/opam/app
 
 # Démarrer le binaire compilé
-CMD ["./run.sh"]
+CMD ["sh", "-c", "eval $(opam env) && dune exec ./TokenDB.exe"]
