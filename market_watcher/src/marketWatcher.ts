@@ -1,5 +1,4 @@
-// Improved Market Watcher for detecting new tokens on Solana
-// Combines the best of live_bot and cubi-sniper implementations
+// Scan Jupiter Token API for tradable tokens
 import fetch from 'node-fetch';
 import Redis from 'ioredis';
 import fs from 'fs';
@@ -7,12 +6,7 @@ import path from 'path';
 
 // Configuration from environment variables
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
-const JUPITER_POOLS_URL = process.env.JUPITER_API_URL 
-  ? `${process.env.JUPITER_API_URL}/pools` 
-  : 'https://quote-api.jup.ag/v6/pools';
-const JUPITER_TOKENS_URL = process.env.JUPITER_API_URL 
-  ? `${process.env.JUPITER_API_URL}/tokens` 
-  : 'https://quote-api.jup.ag/v6/tokens';
+const JUPITER_API_BASE = process.env.JUPITER_API_URL || 'https://quote-api.jup.ag/v6';
 const SEED_INTERVAL = parseInt(process.env.SEED_INTERVAL || '15000'); // 15 sec default
 const DEBUG_MODE = process.env.DEBUG_MODE === 'true';
 const BASE_TOKEN = 'So11111111111111111111111111111111111111112'; // SOL
@@ -28,15 +22,15 @@ const logFile = path.join(LOG_DIR, `marketwatcher_${new Date().toISOString().spl
 const logStream = fs.createWriteStream(logFile, { flags: 'a' });
 
 // Interfaces
-interface JupiterPool {
-  inputMint: string;
-  outputMint: string;
-  outputSymbol?: string;
-  liquidity?: number;
-  volume?: number;
-  swapFeeBps: number;
-  txRate?: number;
-  priceImpactPct?: number;
+interface TokenInfo {
+  address: string;
+  chainId: number;
+  decimals: number;
+  name: string;
+  symbol: string;
+  logoURI?: string;
+  tags?: string[];
+  extensions?: Record<string, any>;
 }
 
 interface TokenFeatures {
@@ -48,6 +42,34 @@ interface TokenFeatures {
   txRate: number;
   impact: number;
   detected_at: number;
+}
+
+interface QuoteResponse {
+  inputMint: string;
+  outputMint: string;
+  amount: string;
+  otherAmountThreshold: string;
+  swapMode: string;
+  slippageBps: number;
+  platformFee?: any;
+  priceImpactPct: number;
+  routePlan: RoutePlan[];
+  contextSlot: number;
+  timeTaken: number;
+}
+
+interface RoutePlan {
+  swapInfo: {
+    ammKey: string;
+    label: string;
+    inputMint: string;
+    outputMint: string;
+    inAmount: string;
+    outAmount: string;
+    feeAmount: string;
+    feeMint: string;
+  };
+  percent: number;
 }
 
 // Cache to avoid reprocessing the same tokens
@@ -231,80 +253,146 @@ class RobustRedisClient {
 const redis = new RobustRedisClient(REDIS_URL);
 
 /**
- * Fetches pool data from Jupiter API
+ * Get all tokens from Jupiter API
  */
-async function getPools(): Promise<JupiterPool[]> {
+async function getAllTokens(): Promise<TokenInfo[]> {
   try {
-    const res = await fetch(`${JUPITER_POOLS_URL}?inputMint=${BASE_TOKEN}`);
-    if (!res.ok) {
-      throw new Error(`HTTP error ${res.status}: ${res.statusText}`);
+    // Using the correct Jupiter API token endpoint
+    const response = await fetch(`${JUPITER_API_BASE}/tokens`);
+    if (!response.ok) {
+      throw new Error(`HTTP error ${response.status}: ${response.statusText}`);
     }
-    const data = await res.json();
-    return data;
+    
+    const data = await response.json();
+    return Array.isArray(data) ? data : [];
   } catch (error) {
-    log(`Error fetching pools: ${error}`, 'error');
+    log(`Error fetching tokens: ${error}`, 'error');
     return [];
+  }
+}
+
+/**
+ * Check if a token is tradable by making a sample quote request
+ */
+async function isTokenTradable(tokenMint: string): Promise<boolean> {
+  try {
+    // Using the quote endpoint to check if the token can be swapped with SOL
+    const url = `${JUPITER_API_BASE}/quote?inputMint=${BASE_TOKEN}&outputMint=${tokenMint}&amount=10000000&slippageBps=50`;
+    const response = await fetch(url);
+    if (!response.ok) {
+      return false;
+    }
+    
+    // Check if there is a valid route
+    const data = await response.json() as any;
+    return data && data.outAmount && Number(data.outAmount) > 0;
+  } catch (error) {
+    log(`Error checking tradability for ${tokenMint}: ${error}`, 'debug');
+    return false;
+  }
+}
+
+/**
+ * Get additional features for a token using a quote request
+ */
+async function getTokenFeatures(tokenMint: string): Promise<Partial<TokenFeatures>> {
+  try {
+    // Make a quote request to get token details like liquidity and price impact
+    const url = `${JUPITER_API_BASE}/quote?inputMint=${BASE_TOKEN}&outputMint=${tokenMint}&amount=100000000&slippageBps=50`;
+    const response = await fetch(url);
+    if (!response.ok) {
+      return {};
+    }
+    
+    const data = await response.json() as QuoteResponse;
+    
+    // Extract relevant data from the quote response
+    return {
+      liquidity: 10, // Not directly provided, would need calculation
+      impact: data.priceImpactPct || 0,
+      swapFee: 0.3, // Not directly provided, would need calculation
+      txRate: 0 // Not directly provided
+    };
+  } catch (error) {
+    log(`Error getting features for ${tokenMint}: ${error}`, 'debug');
+    return {};
   }
 }
 
 /**
  * Process a token and store its data in Redis
  */
-async function enrichAndStore(pool: JupiterPool): Promise<void> {
+async function enrichAndStore(token: TokenInfo): Promise<void> {
   try {
-    const token = pool.outputMint;
+    const tokenMint = token.address;
     
     // Skip SOL itself
-    if (token === BASE_TOKEN) return;
+    if (tokenMint === BASE_TOKEN) return;
     
     // Skip if already processed
-    if (processedTokens.has(token)) {
+    if (processedTokens.has(tokenMint)) {
       if (DEBUG_MODE) {
-        log(`Token ${token} already processed this session, skipping`, 'debug');
+        log(`Token ${tokenMint} already processed this session, skipping`, 'debug');
       }
       return;
     }
 
-    const name = pool.outputSymbol || token.slice(0, 6);
-    const features: TokenFeatures = {
-      mint: token,
-      symbol: name,
-      liquidity: pool.liquidity || 0,
-      volume: pool.volume || 0,
-      swapFee: pool.swapFeeBps / 100,
-      txRate: pool.txRate || 0,
-      impact: pool.priceImpactPct || 0,
+    // Check if token exists in Redis already
+    const key = `token:${tokenMint}`;
+    const exists = await redis.exists(key);
+    if (exists) {
+      return;
+    }
+
+    // Check if token is tradable first (quick filter)
+    const tradable = await isTokenTradable(tokenMint);
+    if (!tradable) {
+      if (DEBUG_MODE) {
+        log(`Token ${token.symbol} (${tokenMint}) is not tradable, skipping`, 'debug');
+      }
+      processedTokens.add(tokenMint);
+      return;
+    }
+
+    // Get additional features for the token
+    const features = await getTokenFeatures(tokenMint);
+    
+    // Create token features object
+    const tokenFeatures: TokenFeatures = {
+      mint: tokenMint,
+      symbol: token.symbol || tokenMint.slice(0, 6),
+      liquidity: features.liquidity || 0,
+      volume: 0, // Not available from API
+      swapFee: features.swapFee || 0,
+      txRate: features.txRate || 0,
+      impact: features.impact || 0,
       detected_at: Date.now()
     };
 
-    // Check if token has sufficient liquidity
-    if (features.liquidity < MIN_LIQUIDITY) {
+    // Check if token has sufficient liquidity (if available)
+    if (tokenFeatures.liquidity < MIN_LIQUIDITY) {
       if (DEBUG_MODE) {
-        log(`Token ${name} (${token}) skipped: insufficient liquidity (${features.liquidity} SOL)`, 'debug');
+        log(`Token ${token.symbol} (${tokenMint}) has insufficient liquidity (${tokenFeatures.liquidity} SOL), skipping`, 'debug');
       }
+      processedTokens.add(tokenMint);
       return;
     }
 
-    const key = `token:${token}`;
-    const exists = await redis.exists(key);
+    log(`[+] New token detected: ${tokenFeatures.symbol} (${tokenMint})`, 'info');
     
-    if (!exists) {
-      log(`[+] New pool detected: ${name} (${token}) - Liquidity: ${features.liquidity} SOL`, 'info');
-      
-      // Store token data in Redis
-      await redis.set(key, JSON.stringify(features));
-      
-      // Announce new token on dedicated channel
-      await redis.publish('new_token', token);
-      
-      // Add to chronological list
-      await redis.zadd('pools', Date.now(), token);
+    // Store token data in Redis
+    await redis.set(key, JSON.stringify(tokenFeatures));
+    
+    // Announce new token on dedicated channel
+    await redis.publish('new_token', tokenMint);
+    
+    // Add to chronological list
+    await redis.zadd('pools', Date.now(), tokenMint);
 
-      // Add to processed tokens for this session
-      processedTokens.add(token);
-    }
+    // Add to processed tokens for this session
+    processedTokens.add(tokenMint);
   } catch (error) {
-    log(`Error processing token from pool: ${error}`, 'error');
+    log(`Error processing token ${token.address}: ${error}`, 'error');
   }
 }
 
@@ -313,7 +401,7 @@ async function enrichAndStore(pool: JupiterPool): Promise<void> {
  */
 async function main() {
   log('🔍 Market Watcher starting...', 'info');
-  log(`Jupiter API URL: ${JUPITER_POOLS_URL}`, 'info');
+  log(`Jupiter API URL: ${JUPITER_API_BASE}`, 'info');
   log(`Scanning interval: ${SEED_INTERVAL/1000}s`, 'info');
   log(`Minimum liquidity: ${MIN_LIQUIDITY} SOL`, 'info');
   
@@ -333,16 +421,24 @@ async function main() {
   
   while (true) {
     try {
-      const pools = await getPools();
-      log(`Checked ${pools.length} pools...`, 'debug');
+      // Get all tokens
+      const tokens = await getAllTokens();
+      log(`Found ${tokens.length} tokens from Jupiter API...`, 'info');
       
-      if (pools.length === 0) {
-        log('Warning: No pools returned from Jupiter API', 'warn');
+      if (tokens.length === 0) {
+        log('Warning: No tokens returned from Jupiter API', 'warn');
       } else {
-        for (const pool of pools) {
-          if (pool.outputMint && pool.outputMint !== BASE_TOKEN) {
-            await enrichAndStore(pool);
-          }
+        // Process a batch of tokens to avoid rate limiting
+        const batchSize = 100;
+        const tokenBatch = tokens.slice(0, batchSize);
+        
+        log(`Processing batch of ${tokenBatch.length} tokens...`, 'debug');
+        
+        // Process tokens sequentially to avoid rate limiting
+        for (const token of tokenBatch) {
+          await enrichAndStore(token);
+          // Add a small delay between requests to avoid rate limiting
+          await new Promise(resolve => setTimeout(resolve, 500));
         }
       }
     } catch (err) {
