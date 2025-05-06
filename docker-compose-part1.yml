@@ -1,0 +1,94 @@
+version: "3.8"
+
+volumes:
+  redis_data:
+    driver: local
+  training_data:
+    driver: local
+  model_data:
+    driver: local
+
+networks:
+  part1_network:
+    driver: bridge
+
+services:
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    volumes:
+      - redis_data:/data
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    command: redis-server /usr/local/etc/redis/redis.conf
+    networks:
+      - part1_network
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  ai_model:
+    build: ./ai_model
+    container_name: ai_model
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./ai_model:/app
+      - model_data:/app/models
+      - training_data:/app/training_data
+    ports:
+      - "${AI_PORT:-8000}:${AI_PORT:-8000}"
+    environment:
+      - AI_PORT=${AI_PORT:-8000}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - TRAINING_DATA_PATH=/app/training_data/training_data.jsonl
+    networks:
+      - part1_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  market_watcher:
+    build: ./market_watcher
+    container_name: market_watcher
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - JUPITER_API_URL=${JUPITER_API_URL:-https://quote-api.jup.ag/v6}
+    volumes:
+      - ./market_watcher:/app
+      - /app/node_modules
+    networks:
+      - part1_network
+    restart: unless-stopped
+    # Fix for the market watcher JSON parsing error
+    command: >
+      sh -c "sed -i 's/const data = await res.json() as JupiterPool\\[\\];/const data = await res.json().catch(e => { console.error(\"JSON parse error\", e); return []; });/' /app/src/marketWatcher.ts &&
+             ts-node src/marketWatcher.ts"
+
+  ui:
+    build: ./ui
+    container_name: ui
+    volumes:
+      - ./ui:/app
+      - /app/node_modules
+    ports:
+      - "${UI_PORT:-3000}:${UI_PORT:-3000}"
+    environment:
+      - VITE_API_BASE=http://localhost:${API_PORT:-4000}
+      - VITE_WS_BASE=ws://localhost:${WS_PORT:-3010}
+      - UI_PORT=${UI_PORT:-3000}
+    networks:
+      - part1_network
+    restart: unless-stopped

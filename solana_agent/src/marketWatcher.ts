@@ -1,22 +1,22 @@
-// Scan Jupiter pour détecter les tokens
+// Scan Jupiter Token API for tradable tokens
 import fetch from 'node-fetch';
 import Redis from 'ioredis';
 
 const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
-const JUPITER_POOLS_URL = 'https://quote-api.jup.ag/v6/pools';
-const JUPITER_TOKENS_URL = 'https://quote-api.jup.ag/v6/tokens';
+const JUPITER_TOKEN_API = 'https://api.jup.ag/tokens/v1'; // Updated to use the Jupiter Token API
 const SEED_INTERVAL = 15_000; // 15 sec
 const BASE_TOKEN = 'So11111111111111111111111111111111111111112'; // SOL
 
-interface JupiterPool {
-  inputMint: string;
-  outputMint: string;
-  outputSymbol?: string;
-  liquidity?: number;
-  volume?: number;
-  swapFeeBps: number;
-  txRate?: number;
-  priceImpactPct?: number;
+interface TokenInfo {
+  address: string;
+  symbol: string;
+  name: string;
+  decimals: number;
+  logoURI?: string;
+  tags?: string[];
+  daily_volume?: number;
+  created_at?: string;
+  extensions?: any;
 }
 
 interface TokenFeatures {
@@ -30,62 +30,154 @@ interface TokenFeatures {
   detected_at: number;
 }
 
-async function getPools(): Promise<JupiterPool[]> {
+// Get tradable tokens from Jupiter Token API
+async function getTradableTokens(): Promise<string[]> {
   try {
-    const res = await fetch(`${JUPITER_POOLS_URL}?inputMint=${BASE_TOKEN}`);
-    const data = await res.json();
-    return data;
+    const response = await fetch(`${JUPITER_TOKEN_API}/mints/tradable`);
+    
+    if (!response.ok) {
+      console.error(`Error response from Jupiter API: ${response.status} ${response.statusText}`);
+      return [];
+    }
+    
+    // Safely parse JSON with error handling
+    try {
+      const text = await response.text();
+      if (!text || text.trim() === '') {
+        console.error('Empty response from Jupiter API');
+        return [];
+      }
+      
+      const data = JSON.parse(text);
+      
+      if (!Array.isArray(data)) {
+        console.error(`Unexpected response format from Jupiter API: ${typeof data}`);
+        return [];
+      }
+      
+      return data;
+    } catch (jsonError) {
+      console.error('JSON parse error:', jsonError);
+      return [];
+    }
   } catch (error) {
-    console.error('Erreur lors de la récupération des pools:', error);
+    console.error('Network error when fetching tradable tokens:', error);
     return [];
   }
 }
 
-async function enrichAndStore(pool: JupiterPool): Promise<void> {
-  const token = pool.outputMint;
-  const name = pool.outputSymbol || token.slice(0, 6);
-  const features: TokenFeatures = {
-    mint: token,
-    symbol: name,
-    liquidity: pool.liquidity || 0,
-    volume: pool.volume || 0,
-    swapFee: pool.swapFeeBps / 100,
-    txRate: pool.txRate || 0,
-    impact: pool.priceImpactPct || 0,
-    detected_at: Date.now()
-  };
+// Get token information
+async function getTokenInfo(mint: string): Promise<TokenInfo | null> {
+  try {
+    const response = await fetch(`${JUPITER_TOKEN_API}/token/${mint}`);
+    
+    if (!response.ok) {
+      if (response.status !== 404) { // Ignore 404 errors
+        console.error(`Error fetching token info for ${mint}: ${response.status} ${response.statusText}`);
+      }
+      return null;
+    }
+    
+    const data = await response.json();
+    return data;
+  } catch (error) {
+    console.error(`Error fetching token info for ${mint}:`, error);
+    return null;
+  }
+}
 
-  const key = `token:${token}`;
-  const exists = await redis.exists(key);
-  if (!exists) {
-    console.log(`[+] Nouveau pool : ${name} (${token})`);
-    await redis.json.set(key, '$', features);
-    await redis.zadd('pools', Date.now(), token); // log chronologique
+async function enrichAndStore(mint: string): Promise<void> {
+  try {
+    // Skip if we've already processed this token
+    const exists = await redis.exists(`token:${mint}`);
+    if (exists) {
+      return;
+    }
+    
+    // Get token information
+    const tokenInfo = await getTokenInfo(mint);
+    if (!tokenInfo) {
+      return;
+    }
+    
+    // Create token features
+    const features: TokenFeatures = {
+      mint: tokenInfo.address,
+      symbol: tokenInfo.symbol || tokenInfo.address.slice(0, 6),
+      liquidity: 0, // Not provided by API
+      volume: tokenInfo.daily_volume || 0,
+      swapFee: 0, // Not provided by API
+      txRate: 0, // Not provided by API
+      impact: 0, // Not provided by API
+      detected_at: Date.now()
+    };
+
+    console.log(`[+] New token: ${features.symbol} (${features.mint})`);
+    
+    // Store in Redis
+    await redis.set(`token:${mint}`, JSON.stringify(features));
+    
+    // Announce new token
+    redis.publish('new_token', mint);
+    
+    // Add to pools list for chronological tracking
+    await redis.zadd('pools', Date.now(), mint);
+  } catch (error) {
+    console.error(`Error processing token ${mint}:`, error);
+  }
+}
+
+// Function to get token data from Redis
+async function getTokenData(token: string): Promise<TokenFeatures | null> {
+  try {
+    const key = `token:${token}`;
+    const jsonStr = await redis.get(key);
+    
+    if (!jsonStr) return null;
+    
+    return JSON.parse(jsonStr) as TokenFeatures;
+  } catch (error) {
+    console.error(`Error retrieving token ${token}:`, error);
+    return null;
   }
 }
 
 async function main() {
   console.log('🔍 Market Watcher démarré...');
-  console.log(`Scanner Jupiter Aggregator toutes les ${SEED_INTERVAL / 1000}s`);
+  console.log(`Scanner Jupiter Token API toutes les ${SEED_INTERVAL / 1000}s`);
+  
+  // Check if Redis is accessible
+  try {
+    await redis.ping();
+    console.log('✅ Connexion Redis établie');
+  } catch (error) {
+    console.error('❌ Erreur de connexion Redis:', error);
+    process.exit(1);
+  }
   
   while (true) {
     try {
-      const pools = await getPools();
-      console.log(`Vérifié ${pools.length} pools...`);
+      // Get tradable tokens
+      const tokens = await getTradableTokens();
+      console.log(`Trouvé ${tokens.length} tokens négociables...`);
       
-      for (const pool of pools) {
-        if (pool.outputMint && pool.outputMint !== BASE_TOKEN) {
-          await enrichAndStore(pool);
-        }
-      }
+      // Process a batch of tokens (limit to avoid rate limiting)
+      const batchSize = 10;
+      const newTokens = tokens.slice(0, batchSize);
+      
+      // Process tokens in parallel
+      await Promise.all(newTokens.map(mint => enrichAndStore(mint)));
+      
     } catch (err) {
-      console.error('Erreur watcher Jupiter :', err);
+      console.error('Erreur watcher Jupiter:', err);
     }
+    
+    // Wait before next check
     await new Promise((r) => setTimeout(r, SEED_INTERVAL));
   }
 }
 
-// Gestion propre des interruptions
+// Handle interrupts gracefully
 process.on('SIGTERM', async () => {
   console.log('🛑 Arrêt du Market Watcher...');
   await redis.quit();
@@ -98,4 +190,7 @@ process.on('SIGINT', async () => {
   process.exit(0);
 });
 
-main();
+main().catch(error => {
+  console.error('Fatal error in market watcher:', error);
+  process.exit(1);
+});

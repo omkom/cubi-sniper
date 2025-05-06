@@ -1,7 +1,7 @@
 // Main agent entrypoint for Cubi-sniper
 import Redis from 'ioredis';
 import { isWalletActivated } from './licenseChecker';
-import { Strategy } from '../types';
+import { Strategy, TokenFeatures as GlobalTokenFeatures } from '../types';
 import { verifyToken } from './poolVerifier';
 import { getOcamlScore } from './ocamlBridge';
 import fetch from 'node-fetch';
@@ -32,6 +32,11 @@ function log(message: string, level: 'info' | 'error' | 'warn' = 'info') {
   logStream.write(logMessage + '\n');
 }
 
+// Define local TokenFeatures interface with index signature
+interface TokenFeatures extends GlobalTokenFeatures {
+  [key: string]: any; // Add index signature
+}
+
 // Redis Client avec reconnexion automatique
 class RobustRedisClient {
   private redis: Redis | null = null;
@@ -44,7 +49,7 @@ class RobustRedisClient {
 
   private connect() {
     try {
-      this.redis = new Redis(this.redisUrl, {
+      this.redis = new Redis(redisUrl, {
         retryStrategy: (times) => {
           if (times > 10) {
             log(`Redis reconnect failed after ${times} attempts`, 'error');
@@ -153,7 +158,7 @@ class RobustRedisClient {
     }
   }
 
-  public async subscribe(channel: string): Promise<Redis.Redis> {
+  public async subscribe(channel: string): Promise<Redis> {
     if (!this.isConnected || !this.redis) {
       await this.reconnect();
     }
@@ -211,20 +216,6 @@ class RobustRedisClient {
 // Initialize Redis client
 const redis = new RobustRedisClient(REDIS_URL);
 
-interface TokenFeatures {
-  mint: string;
-  symbol: string;
-  liquidity: number;
-  volume: number;
-  volatility_1m?: number;
-  buy_sell_ratio?: number;
-  time_to_pool?: number;
-  holders?: number;
-  ai_score?: number;
-  creator_score?: number;
-  [key: string]: any;
-}
-
 async function loadStrategies(): Promise<Strategy[]> {
   try {
     // Essayer de charger les stratégies depuis Redis d'abord (persistance)
@@ -255,7 +246,7 @@ async function loadStrategies(): Promise<Strategy[]> {
           let retries = 0;
           while (retries < 3) {
             try {
-              const score = await getOcamlScore(f);
+              const score = await getOcamlScore(f as Record<string, number>);
               log(`🧠 [OCAML] Score = ${score}`);
               return score > 0.75;
             } catch (error) {
@@ -295,14 +286,18 @@ async function enrichTokenFeatures(token: string): Promise<TokenFeatures | null>
     const aiFeatures = await fetchAIScoring(baseFeatures);
     
     // Données enrichies
-    const enrichedFeatures = {
+    const enrichedFeatures: TokenFeatures = {
       ...baseFeatures,
       ...aiFeatures,
       volatility_1m: Math.random() * 0.4,  // Placeholder - normalement calculé
       buy_sell_ratio: 1.0 + Math.random() * 2.0,  // Placeholder
       time_to_pool: baseFeatures.detected_at ? (Date.now() - baseFeatures.detected_at) / 1000 : 60,
       holders: Math.floor(20 + Math.random() * 100),
-      creator_score: 0.7 + Math.random() * 0.3
+      creator_score: 0.7 + Math.random() * 0.3,
+      swapFee: baseFeatures.swapFee || 0,
+      txRate: baseFeatures.txRate || 0,
+      impact: baseFeatures.impact || 0,
+      detected_at: baseFeatures.detected_at || Date.now()
     };
     
     // Sauvegarder les features enrichies pour réutilisation
@@ -345,12 +340,17 @@ async function fetchAIScoring(features: any): Promise<any> {
     }
 
     const data = await response.json();
-    return {
-      ai_score: data.roi_per_sec > 0 ? 
-        Math.min(0.95, 0.5 + data.roi_per_sec * 5) : 
-        Math.max(0.1, 0.5 - Math.abs(data.roi_per_sec) * 2),
-      roi_prediction: data.roi_per_sec
-    };
+    if (typeof data === 'object') {
+      return {
+        ai_score: data.roi_per_sec > 0 ? 
+          Math.min(0.95, 0.5 + data.roi_per_sec * 5) : 
+          Math.max(0.1, 0.5 - Math.abs(data.roi_per_sec as number) * 2),
+        roi_prediction: data.roi_per_sec
+      };
+    } else {
+      log(`Unexpected AI model response: ${JSON.stringify(data)}`, 'warn');
+      return { ai_score: 0.5, roi_prediction: 0.001 };
+    }
   } catch (error) {
     log(`Error fetching AI scoring: ${error}`, 'error');
     // Valeurs de repli en cas d'échec
@@ -387,7 +387,7 @@ async function processNewToken(token: string, strategies: Strategy[]) {
   }
   
   // 3. Vérifier contre les stratégies
-  log(`Features for ${token}:`, JSON.stringify(features));
+  log(`Features for ${token}: ${JSON.stringify(features)}`);
   for (const strategy of strategies) {
     try {
       const result = await strategy.condition(features);
@@ -433,9 +433,11 @@ async function watchNewTokens(strategies: Strategy[]) {
   try {
     const subscriber = await redis.subscribe('new_token');
     
-    subscriber.on('message', async (channel, token) => {
+    subscriber.on('message', (channel: string, token: string) => {
       if (channel === 'new_token') {
-        await processNewToken(token, strategies);
+        processNewToken(token, strategies).catch(error => {
+          log(`Error processing token ${token}: ${error}`, 'error');
+        });
       }
     });
     

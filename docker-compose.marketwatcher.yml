@@ -1,0 +1,45 @@
+volumes:
+  redis_data:
+    driver: local
+
+networks:
+  internal:
+    driver: bridge
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    volumes:
+      - redis_data:/data
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf
+    command: redis-server /usr/local/etc/redis/redis.conf
+    networks:
+      - internal
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  market_watcher:
+    build: ./market_watcher
+    container_name: market_watcher
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - JUPITER_API_URL=${JUPITER_API_URL:-https://quote-api.jup.ag/v4}
+    volumes:
+      - ./market_watcher:/app
+      - /app/node_modules
+    networks:
+      - internal
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
