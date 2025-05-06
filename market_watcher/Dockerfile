@@ -1,17 +1,24 @@
-# Use the official Node.js image with Alpine Linux
 FROM node:20-alpine
 
-# Set the working directory
 WORKDIR /app
 
-# Copy package.json and package-lock.json (if available)
+# Install necessary tools
+RUN apk add --no-cache bash curl
+
+# Copy package files first (for better caching)
 COPY package*.json ./
 
 # Install dependencies
-RUN npm install -g ts-node typescript && npm install
+RUN npm install
 
-# Copy the rest of the application code
+# Copy source code
 COPY . .
 
+# Create logs directory
+RUN mkdir -p logs
+
+# Set up environment
+ENV NODE_ENV=production
+
 # Command to run the application
-CMD ["ts-node", "src/marketWatcher.ts"]
+CMD ["npx", "ts-node", "src/marketWatcher.ts"]

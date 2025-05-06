@@ -1,72 +1,34 @@
-/*
- * Market‑Watcher (Jupiter v6) – env‑driven version
- * -------------------------------------------------
- * Reads its configuration exclusively from process.env (see .env sample below)
- * and scans the SOL side of Jupiter for fresh output mints.
- * Found pools are cached in Redis and a token‑mint is published on channel
- * `new_token` the first time we detect it.
- * ---------------------------------------------------------------------------
- * Required env keys (with defaults in parentheses)
- *   REDIS_URL                      – redis://localhost:6379
- *   JUPITER_API_BASE               – https://quote-api.jup.ag/v6   (quote base)
- *   BASE_TOKEN                     – So11111111111111111111111111111111111111112
- *   SCAN_INTERVAL_MS               – 15000
- * ---------------------------------------------------------------------------
- * Optional env keys
- *   ENV                            – prod | local  (only affects logging)
- *   DEBUG                          – true | false – extra logs
- * ---------------------------------------------------------------------------
- * 2025‑05 – works with Jupiter route‑map & pools endpoints.
- */
-
-import 'dotenv/config';
-import fetch, { RequestInit, Headers as NodeFetchHeaders } from 'node-fetch';
+// Improved Market Watcher for detecting new tokens on Solana
+// Combines the best of live_bot and cubi-sniper implementations
+import fetch from 'node-fetch';
 import Redis from 'ioredis';
-import { PublicKey } from '@solana/web3.js';
-import axios from 'axios';
-import { logger, readLogsFile, addLogEntry } from './logger';
-import { getPairInformation, getLiquidityInfo } from './solana';
-import { evaluateToken } from './tokenValidator';
+import fs from 'fs';
+import path from 'path';
 
-// ----------------------- configuration helpers ----------------------
+// Configuration from environment variables
+const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
+const JUPITER_POOLS_URL = process.env.JUPITER_API_URL 
+  ? `${process.env.JUPITER_API_URL}/pools` 
+  : 'https://quote-api.jup.ag/v6/pools';
+const JUPITER_TOKENS_URL = process.env.JUPITER_API_URL 
+  ? `${process.env.JUPITER_API_URL}/tokens` 
+  : 'https://quote-api.jup.ag/v6/tokens';
+const SEED_INTERVAL = parseInt(process.env.SEED_INTERVAL || '15000'); // 15 sec default
+const DEBUG_MODE = process.env.DEBUG_MODE === 'true';
+const BASE_TOKEN = 'So11111111111111111111111111111111111111112'; // SOL
+const MIN_LIQUIDITY = parseFloat(process.env.MIN_LIQUIDITY || '1');
 
-const cfg = {
-  redisUrl: process.env.REDIS_URL ?? 'redis://localhost:6379',
-  jupBase: normalizeQuoteBase(process.env.JUPITER_API_BASE),
-  baseMint: process.env.BASE_TOKEN ?? 'So11111111111111111111111111111111111111112',
-  scanEvery: Number(process.env.SCAN_INTERVAL_MS ?? '15000'),
-  env: process.env.ENV ?? 'prod',
-  debug: /^true$/i.test(process.env.DEBUG ?? '')
-} as const;
-
-function normalizeQuoteBase(url?: string): string {
-  if (!url) return 'https://quote-api.jup.ag/v6';
-  // accept either /swap/v1 or /v6 or bare; always strip trailing path after hostname
-  return url.replace(/\/swap\/v\d+$/, '').replace(/\/$/, '');
+// Set up logging
+const LOG_DIR = path.join(__dirname, '../logs');
+if (!fs.existsSync(LOG_DIR)) {
+  fs.mkdirSync(LOG_DIR, { recursive: true });
 }
 
-// ----------------------- derived Jupiter endpoints ------------------
+const logFile = path.join(LOG_DIR, `marketwatcher_${new Date().toISOString().split('T')[0]}.log`);
+const logStream = fs.createWriteStream(logFile, { flags: 'a' });
 
-const ENDPOINT = {
-  routeMap: `${cfg.jupBase}/route-map`, // Corrected endpoint
-  pools: `${cfg.jupBase}/pools`,
-  tokens: `${cfg.jupBase}/tokens`
-} as const;
-
-// ----------------------------- redis --------------------------------
-
-const redis = new Redis(cfg.redisUrl, {
-  retryStrategy: (times: number) => {
-    // Reconnect after 2^times * 100 ms
-    return Math.min(times * 100, 3000);
-  }
-});
-
-// ----------------------------- types --------------------------------
-
-type RouteMap = Record<string, string[]>;
-
-interface RawPool {
+// Interfaces
+interface JupiterPool {
   inputMint: string;
   outputMint: string;
   outputSymbol?: string;
@@ -75,13 +37,6 @@ interface RawPool {
   swapFeeBps: number;
   txRate?: number;
   priceImpactPct?: number;
-}
-
-interface TokenMeta {
-  address: string;
-  symbol: string;
-  name: string;
-  decimals: number;
 }
 
 interface TokenFeatures {
@@ -95,241 +50,335 @@ interface TokenFeatures {
   detected_at: number;
 }
 
-interface LogEntry {
-  type: string;
-  data: {
-    address: string;
-  };
+// Cache to avoid reprocessing the same tokens
+const processedTokens = new Set();
+
+// Logging function
+function log(message: string, level: 'info' | 'error' | 'warn' | 'debug' = 'info') {
+  if (level === 'debug' && !DEBUG_MODE) return;
+  
+  const timestamp = new Date().toISOString();
+  const logMessage = `[${timestamp}] [${level.toUpperCase()}] ${message}`;
+  
+  console.log(logMessage);
+  logStream.write(logMessage + '\n');
 }
 
-interface TokenInfo extends TokenMeta {
-  initialPrice: number;
-  liquiditySOL: number;
-  volume24h: number;
-  priceChange: any;
-  txns: any;
-  pairAddress: string;
-  isNew: boolean;
-  source: string;
-  validationScore?: number;
-  risk?: string;
-  recommendation?: string;
-}
+// Robust Redis client with reconnection logic
+class RobustRedisClient {
+  private redis: Redis | null = null;
+  private reconnectAttempts = 0;
+  private isConnected = false;
+  private maxRetries = 5;
 
-// Cache for processed pools to avoid reprocessing
-const processedPools = new Set<string>();
+  constructor(private redisUrl: string) {
+    this.connect();
+  }
 
-// --------------------------- fetch utils ----------------------------
-
-async function safeFetch<T>(url: string, init: RequestInit = {}, maxRetry = 3): Promise<T | null> {
-  let attempt = 0;
-  let backoff = 1000;
-  while (attempt < maxRetry) {
+  private connect() {
     try {
-      // Create a new Headers object and populate it
-      const headers = new NodeFetchHeaders(init.headers);
-      headers.set('accept-encoding', 'gzip');
-
-      const res = await fetch(url, {
-        ...init,
-        headers: headers
+      this.redis = new Redis(this.redisUrl, {
+        retryStrategy: (times) => {
+          if (times > 10) {
+            log(`Redis reconnect failed after ${times} attempts`, 'error');
+            return null; // Stop retrying
+          }
+          const delay = Math.min(times * 500, 5000);
+          log(`Redis reconnecting in ${delay}ms (attempt ${times})`, 'warn');
+          return delay;
+        }
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return (await res.json()) as T;
-    } catch (err) {
-      attempt += 1;
-      console.error(`[fetch] ${url} – ${err} (attempt ${attempt})`);
-      if (attempt >= maxRetry) break;
-      await new Promise(r => setTimeout(r, backoff));
-      backoff *= 2;
+
+      this.redis.on('connect', () => {
+        this.isConnected = true;
+        this.reconnectAttempts = 0;
+        log('Redis connected successfully', 'info');
+      });
+
+      this.redis.on('error', (err) => {
+        log(`Redis error: ${err.message}`, 'error');
+        this.isConnected = false;
+      });
+
+      this.redis.on('close', () => {
+        log('Redis connection closed', 'warn');
+        this.isConnected = false;
+      });
+    } catch (error) {
+      log(`Redis connection failed: ${error}`, 'error');
+      this.isConnected = false;
     }
   }
-  return null;
-}
 
-// --------------------------- jupiter helpers ------------------------
+  public async get(key: string): Promise<string | null> {
+    if (!this.isConnected || !this.redis) {
+      await this.reconnect();
+    }
+    try {
+      return await this.redis!.get(key);
+    } catch (error) {
+      log(`Redis get error: ${error}`, 'error');
+      return null;
+    }
+  }
 
-async function getOutputMints(): Promise<string[]> {
-  const data = await safeFetch<{ routeMap: RouteMap }>(`${ENDPOINT.routeMap}?inputMint=${cfg.baseMint}`);
-  return data?.routeMap?.[cfg.baseMint] ?? [];
-}
+  public async set(key: string, value: string): Promise<boolean> {
+    if (!this.isConnected || !this.redis) {
+      await this.reconnect();
+    }
+    try {
+      await this.redis!.set(key, value);
+      return true;
+    } catch (error) {
+      log(`Redis set error: ${error}`, 'error');
+      return false;
+    }
+  }
 
-async function getPools(mints: string[]): Promise<RawPool[]> {
-  if (!mints.length) return [];
-  const qs = mints.map(m => `outputMint=${m}`).join('&');
-  return (await safeFetch<RawPool[]>(`${ENDPOINT.pools}?inputMint=${cfg.baseMint}&${qs}`)) ?? [];
-}
+  public async exists(key: string): Promise<number> {
+    if (!this.isConnected || !this.redis) {
+      await this.reconnect();
+    }
+    try {
+      return await this.redis!.exists(key);
+    } catch (error) {
+      log(`Redis exists error: ${error}`, 'error');
+      return 0;
+    }
+  }
 
-const tokenMetaCache = new Map<string, TokenMeta>();
-async function getTokenMeta(mint: string): Promise<TokenMeta | null> {
-  if (tokenMetaCache.has(mint)) return tokenMetaCache.get(mint)!;
-  const meta = await safeFetch<TokenMeta>(`${ENDPOINT.tokens}/${mint}`);
-  if (meta) tokenMetaCache.set(mint, meta);
-  return meta ?? null;
-}
+  public async publish(channel: string, message: string): Promise<boolean> {
+    if (!this.isConnected || !this.redis) {
+      await this.reconnect();
+    }
+    try {
+      await this.redis!.publish(channel, message);
+      return true;
+    } catch (error) {
+      log(`Redis publish error: ${error}`, 'error');
+      return false;
+    }
+  }
 
-// --------------------------- redis helpers --------------------------
+  public async zadd(key: string, score: number, member: string): Promise<boolean> {
+    if (!this.isConnected || !this.redis) {
+      await this.reconnect();
+    }
+    try {
+      await this.redis!.zadd(key, score, member);
+      return true;
+    } catch (error) {
+      log(`Redis zadd error: ${error}`, 'error');
+      return false;
+    }
+  }
 
-function key(mint: string): string {
-  return `token:${mint}`;
-}
+  public async ping(): Promise<boolean> {
+    if (!this.isConnected || !this.redis) {
+      await this.reconnect();
+    }
+    try {
+      const result = await this.redis!.ping();
+      return result === 'PONG';
+    } catch (error) {
+      log(`Redis ping error: ${error}`, 'error');
+      return false;
+    }
+  }
 
-async function maybeStore(pool: RawPool): Promise<void> {
-  const mint = pool.outputMint;
-  const redisKey = key(mint);
-  if (await redis.exists(redisKey)) return;
+  private async reconnect() {
+    if (this.reconnectAttempts >= this.maxRetries) {
+      log('Max reconnect attempts reached. Exiting...', 'error');
+      process.exit(1);
+    }
 
-  const meta = await getTokenMeta(mint);
-
-  const doc: TokenFeatures = {
-    mint,
-    symbol: meta?.symbol ?? pool.outputSymbol ?? mint.slice(0, 6),
-    liquidity: pool.liquidity ?? 0,
-    volume: pool.volume ?? 0,
-    swapFee: pool.swapFeeBps / 100,
-    txRate: pool.txRate ?? 0,
-    impact: pool.priceImpactPct ?? 0,
-    detected_at: Date.now()
-  };
-
-  const pipe = redis.pipeline();
-  pipe.set(redisKey, JSON.stringify(doc));
-  pipe.zadd('pools', Date.now(), mint);
-  pipe.publish('new_token', mint);
-  await pipe.exec();
-
-  console.log(`🆕  ${doc.symbol} (${mint})`);
-}
-
-// --------------------------- pool detection logic -------------------
-
-async function detectNewPools(): Promise<void> {
-  try {
-    const dexScreenerApiUrl = process.env.DEX_SCREENER_API_URL || 'https://api.dexscreener.com';
-    const response = await axios.get(`${dexScreenerApiUrl}/token-profiles/latest/v1`);
-    const newPools = response.data;
-
-    logger.debug(`${newPools.length} nouveaux pools détectés via DexScreener`);
-
-    const logs = await readLogsFile();
-    const existingTokens = new Set(
-      logs.filter((log: LogEntry) => log.type === 'TOKEN_DETECTED')
-          .map(log => log.data.address)
-    );
-
-    logger.debug(`${existingTokens.size} tokens existants dans les logs`);
-
-    for (const token of newPools) {
-      if (token.chainId !== 'solana') continue;
-
-      const tokenAddress = token.tokenAddress;
-
-      if (processedPools.has(tokenAddress) || existingTokens.has(tokenAddress)) {
-        continue;
-      }
-
-      processedPools.add(tokenAddress);
-
+    log(`Attempting to reconnect to Redis (${++this.reconnectAttempts}/${this.maxRetries})...`, 'warn');
+    
+    if (this.redis) {
       try {
-        const pairInfo = await getPairInformation('solana', tokenAddress);
-
-        if (!pairInfo?.baseToken?.name || !pairInfo?.baseToken?.symbol) {
-          logger.debug(`Structure d'information de paire invalide pour ${tokenAddress}`);
-          continue;
-        }
-
-        const tokenInfo: TokenInfo = {
-          address: tokenAddress,
-          name: pairInfo.baseToken.name,
-          symbol: pairInfo.baseToken.symbol,
-          initialPrice: parseFloat(pairInfo.priceNative) || 0,
-          liquiditySOL: pairInfo.liquidity?.quote || 0,
-          volume24h: pairInfo.volume?.h24 || 0,
-          priceChange: pairInfo.priceChange,
-          txns: pairInfo.txns,
-          pairAddress: pairInfo.pairAddress,
-          isNew: true,
-          source: "pool_detection"
-        };
-
-        const txns = pairInfo.txns || { m5: {}, h1: {}, h6: {}, h24: {} };
-        const buySellRatioM5 = (txns.m5?.buys || 0) / Math.max(txns.m5?.sells || 1, 1);
-        const buySellRatioH1 = (txns.h1?.buys || 0) / Math.max(txns.h1?.sells || 1, 1);
-
-        if (tokenInfo.liquiditySOL < Number(process.env.MIN_LIQUIDITY_SOL ?? '1')) {
-          logger.debug(`Token ${tokenAddress} ignoré: liquidité insuffisante (${tokenInfo.liquiditySOL} < ${process.env.MIN_LIQUIDITY_SOL} SOL)`);
-          continue;
-        }
-
-        logger.info(`Nouveau pool détecté: ${tokenInfo.name} (${tokenInfo.symbol}) - Prix: ${tokenInfo.initialPrice} SOL - Liquidité: ${tokenInfo.liquiditySOL} SOL`);
-        logger.debug(`Ratio achats/ventes (5m): ${buySellRatioM5.toFixed(2)}, (1h): ${buySellRatioH1.toFixed(2)}`);
-
-        const evaluation = await evaluateToken(tokenInfo);
-
-        tokenInfo.validationScore = evaluation.overallScore;
-        tokenInfo.risk = evaluation.risk;
-        tokenInfo.recommendation = evaluation.buyRecommendation;
-
-        await addLogEntry('TOKEN_DETECTED', tokenInfo);
-
-      } catch (tokenError) {
-        logger.error(`Erreur lors du traitement du token ${tokenAddress}: ${(tokenError as Error).message}`);
+        this.redis.disconnect();
+      } catch (e) {
+        // Ignore disconnect errors
       }
+    }
 
-      await new Promise(resolve => setTimeout(resolve, 500));
+    this.connect();
+
+    // Wait for connection to establish
+    return new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error('Redis reconnect timeout'));
+      }, 5000);
+
+      const interval = setInterval(() => {
+        if (this.isConnected) {
+          clearTimeout(timeout);
+          clearInterval(interval);
+          resolve();
+        }
+      }, 100);
+    });
+  }
+
+  public async quit(): Promise<void> {
+    if (this.redis) {
+      await this.redis.quit();
+    }
+  }
+}
+
+// Initialize Redis client
+const redis = new RobustRedisClient(REDIS_URL);
+
+/**
+ * Fetches pool data from Jupiter API
+ */
+async function getPools(): Promise<JupiterPool[]> {
+  try {
+    const res = await fetch(`${JUPITER_POOLS_URL}?inputMint=${BASE_TOKEN}`);
+    if (!res.ok) {
+      throw new Error(`HTTP error ${res.status}: ${res.statusText}`);
+    }
+    const data = await res.json();
+    return data;
+  } catch (error) {
+    log(`Error fetching pools: ${error}`, 'error');
+    return [];
+  }
+}
+
+/**
+ * Process a token and store its data in Redis
+ */
+async function enrichAndStore(pool: JupiterPool): Promise<void> {
+  try {
+    const token = pool.outputMint;
+    
+    // Skip SOL itself
+    if (token === BASE_TOKEN) return;
+    
+    // Skip if already processed
+    if (processedTokens.has(token)) {
+      if (DEBUG_MODE) {
+        log(`Token ${token} already processed this session, skipping`, 'debug');
+      }
+      return;
+    }
+
+    const name = pool.outputSymbol || token.slice(0, 6);
+    const features: TokenFeatures = {
+      mint: token,
+      symbol: name,
+      liquidity: pool.liquidity || 0,
+      volume: pool.volume || 0,
+      swapFee: pool.swapFeeBps / 100,
+      txRate: pool.txRate || 0,
+      impact: pool.priceImpactPct || 0,
+      detected_at: Date.now()
+    };
+
+    // Check if token has sufficient liquidity
+    if (features.liquidity < MIN_LIQUIDITY) {
+      if (DEBUG_MODE) {
+        log(`Token ${name} (${token}) skipped: insufficient liquidity (${features.liquidity} SOL)`, 'debug');
+      }
+      return;
+    }
+
+    const key = `token:${token}`;
+    const exists = await redis.exists(key);
+    
+    if (!exists) {
+      log(`[+] New pool detected: ${name} (${token}) - Liquidity: ${features.liquidity} SOL`, 'info');
+      
+      // Store token data in Redis
+      await redis.set(key, JSON.stringify(features));
+      
+      // Announce new token on dedicated channel
+      await redis.publish('new_token', token);
+      
+      // Add to chronological list
+      await redis.zadd('pools', Date.now(), token);
+
+      // Add to processed tokens for this session
+      processedTokens.add(token);
     }
   } catch (error) {
-    logger.error(`Erreur lors de la détection de nouveaux pools: ${(error as Error).message}`);
+    log(`Error processing token from pool: ${error}`, 'error');
   }
 }
 
-// ----------------------------- scanner ------------------------------
-
-async function scan(): Promise<void> {
-  const outputs = await getOutputMints();
-  if (cfg.debug) console.log(`[scan] outputs: ${outputs.length}`);
-
-  for (let i = 0; i < outputs.length; i += 200) {
-    const slice = outputs.slice(i, i + 200);
-    const pools = await getPools(slice);
-    await Promise.all(pools.map(p => maybeStore(p)));
-  }
-
-  await detectNewPools(); // Integrate pool detection logic
-}
-
-// ----------------------------- main ---------------------------------
-
-async function main(): Promise<void> {
-  console.log(`🔍 Market‑Watcher started – env=${cfg.env}, interval=${cfg.scanEvery}ms`);
-
+/**
+ * Main function
+ */
+async function main() {
+  log('🔍 Market Watcher starting...', 'info');
+  log(`Jupiter API URL: ${JUPITER_POOLS_URL}`, 'info');
+  log(`Scanning interval: ${SEED_INTERVAL/1000}s`, 'info');
+  log(`Minimum liquidity: ${MIN_LIQUIDITY} SOL`, 'info');
+  
+  // Check Redis connection
   try {
-    await redis.ping();
-    console.log('✅ Redis connection OK');
-  } catch (e) {
-    console.error('❌ Redis not reachable');
+    const pingResult = await redis.ping();
+    if (pingResult) {
+      log('✅ Redis connection established', 'info');
+    } else {
+      log('❌ Failed to ping Redis', 'error');
+      process.exit(1);
+    }
+  } catch (error) {
+    log(`❌ Redis connection error: ${error}`, 'error');
     process.exit(1);
   }
-
-  const shutdown = async () => {
-    console.log('\n👋 shutting down…');
-    await redis.quit();
-    process.exit(0);
-  };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
-
+  
   while (true) {
     try {
-      await scan();
+      const pools = await getPools();
+      log(`Checked ${pools.length} pools...`, 'debug');
+      
+      if (pools.length === 0) {
+        log('Warning: No pools returned from Jupiter API', 'warn');
+      } else {
+        for (const pool of pools) {
+          if (pool.outputMint && pool.outputMint !== BASE_TOKEN) {
+            await enrichAndStore(pool);
+          }
+        }
+      }
     } catch (err) {
-      console.error('[scanner]', err);
+      log(`Error in main loop: ${err}`, 'error');
     }
-    await new Promise(r => setTimeout(r, cfg.scanEvery));
+    
+    // Wait for next iteration
+    await new Promise((r) => setTimeout(r, SEED_INTERVAL));
   }
 }
 
-main().catch(err => {
-  console.error('fatal', err);
+// Proper shutdown handling
+process.on('SIGTERM', async () => {
+  log('🛑 Received SIGTERM - Shutting down Market Watcher...', 'info');
+  await redis.quit();
+  logStream.end();
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  log('🛑 Received SIGINT - Shutting down Market Watcher...', 'info');
+  await redis.quit();
+  logStream.end();
+  process.exit(0);
+});
+
+// Handle uncaught exceptions
+process.on('uncaughtException', async (error) => {
+  log(`Uncaught exception: ${error}\n${error.stack}`, 'error');
+  await redis.quit();
+  logStream.end();
+  process.exit(1);
+});
+
+// Start the market watcher
+main().catch(error => {
+  log(`Fatal error in main process: ${error}`, 'error');
   process.exit(1);
 });
