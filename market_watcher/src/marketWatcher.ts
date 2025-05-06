@@ -253,21 +253,92 @@ class RobustRedisClient {
 const redis = new RobustRedisClient(REDIS_URL);
 
 /**
- * Get all tokens from Jupiter API
+ * Validate token data to ensure it has all required fields
  */
-async function getAllTokens(): Promise<TokenInfo[]> {
+function isValidToken(token: any): token is TokenInfo {
+  return (
+    token &&
+    typeof token === 'object' &&
+    typeof token.address === 'string' &&
+    typeof token.symbol === 'string' &&
+    typeof token.name === 'string' &&
+    typeof token.decimals === 'number'
+  );
+}
+
+/**
+ * Get all tradable token mints from Jupiter API
+ */
+async function getTradableTokenMints(): Promise<string[]> {
   try {
-    // Using the correct Jupiter API token endpoint
-    const response = await fetch(`${JUPITER_API_BASE}/tokens`);
+    // Using the correct Jupiter Token API endpoint for tradable mints
+    const response = await fetch('https://lite-api.jup.ag/tokens/v1/mints/tradable');
     if (!response.ok) {
       throw new Error(`HTTP error ${response.status}: ${response.statusText}`);
     }
     
     const data = await response.json();
-    return Array.isArray(data) ? data : [];
+    
+    // Validate that the data is an array
+    if (!Array.isArray(data)) {
+      log('API response is not an array', 'error');
+      return [];
+    }
+    
+    // Filter out non-string values
+    const validMints = data.filter(mint => typeof mint === 'string');
+    
+    if (validMints.length < data.length) {
+      log(`Filtered out ${data.length - validMints.length} invalid token mints`, 'warn');
+    }
+    
+    return validMints;
   } catch (error) {
-    log(`Error fetching tokens: ${error}`, 'error');
+    log(`Error fetching tradable token mints: ${error}`, 'error');
     return [];
+  }
+}
+
+/**
+ * Get token info from Jupiter API
+ */
+async function getTokenInfo(mint: string): Promise<TokenInfo | null> {
+  try {
+    const response = await fetch(`https://lite-api.jup.ag/tokens/v1/token/${mint}`);
+    if (!response.ok) {
+      if (response.status !== 404) {
+        log(`Error fetching token info for ${mint}: ${response.status}`, 'debug');
+      }
+      return null;
+    }
+    
+    const data = await response.json();
+    
+    // Basic validation of token info
+    if (!data || typeof data !== 'object') {
+      return null;
+    }
+    
+    // Use type assertion since we know the response shape
+    const tokenData = data as any;
+    
+    if (!tokenData.address || !tokenData.symbol) {
+      log(`Token data missing required fields for ${mint}`, 'debug');
+      return null;
+    }
+    
+    return {
+      address: tokenData.address,
+      chainId: tokenData.chainId || 101, // Default to Solana mainnet
+      decimals: tokenData.decimals || 0,
+      name: tokenData.name || tokenData.symbol,
+      symbol: tokenData.symbol,
+      logoURI: tokenData.logoURI,
+      tags: tokenData.tags || []
+    };
+  } catch (error) {
+    log(`Error fetching token info for ${mint}: ${error}`, 'debug');
+    return null;
   }
 }
 
@@ -324,6 +395,12 @@ async function getTokenFeatures(tokenMint: string): Promise<Partial<TokenFeature
  */
 async function enrichAndStore(token: TokenInfo): Promise<void> {
   try {
+    // Extra validation to ensure token has all required fields
+    if (!isValidToken(token)) {
+      log(`Skipping invalid token object: ${JSON.stringify(token).substring(0, 100)}...`, 'debug');
+      return;
+    }
+    
     const tokenMint = token.address;
     
     // Skip SOL itself
@@ -332,7 +409,7 @@ async function enrichAndStore(token: TokenInfo): Promise<void> {
     // Skip if already processed
     if (processedTokens.has(tokenMint)) {
       if (DEBUG_MODE) {
-        log(`Token ${tokenMint} already processed this session, skipping`, 'debug');
+        log(`Token ${token.symbol} (${tokenMint}) already processed this session, skipping`, 'debug');
       }
       return;
     }
@@ -392,7 +469,7 @@ async function enrichAndStore(token: TokenInfo): Promise<void> {
     // Add to processed tokens for this session
     processedTokens.add(tokenMint);
   } catch (error) {
-    log(`Error processing token ${token.address}: ${error}`, 'error');
+    log(`Error processing token ${token.address || 'unknown'}: ${error}`, 'error');
   }
 }
 
@@ -421,24 +498,87 @@ async function main() {
   
   while (true) {
     try {
-      // Get all tokens
-      const tokens = await getAllTokens();
-      log(`Found ${tokens.length} tokens from Jupiter API...`, 'info');
+      // Get all tradable token mints
+      const mints = await getTradableTokenMints();
+      log(`Found ${mints.length} tradable token mints from Jupiter API...`, 'info');
       
-      if (tokens.length === 0) {
-        log('Warning: No tokens returned from Jupiter API', 'warn');
+      if (mints.length === 0) {
+        log('Warning: No tradable tokens returned from Jupiter API', 'warn');
       } else {
         // Process a batch of tokens to avoid rate limiting
         const batchSize = 100;
-        const tokenBatch = tokens.slice(0, batchSize);
+        const mintBatch = mints.slice(0, batchSize);
         
-        log(`Processing batch of ${tokenBatch.length} tokens...`, 'debug');
+        log(`Processing batch of ${mintBatch.length} token mints...`, 'debug');
         
-        // Process tokens sequentially to avoid rate limiting
-        for (const token of tokenBatch) {
-          await enrichAndStore(token);
+        // Fetch detailed info for all tokens in batch
+        const tokenDetails = [];
+        
+        for (const mint of mintBatch) {
+          try {
+            // Skip if already processed
+            if (processedTokens.has(mint)) {
+              if (DEBUG_MODE) {
+                log(`Token mint ${mint} already processed this session, skipping`, 'debug');
+              }
+              continue;
+            }
+
+            // Check if token exists in Redis already
+            const key = `token:${mint}`;
+            const exists = await redis.exists(key);
+            if (exists) {
+              processedTokens.add(mint);
+              continue;
+            }
+            
+            // Get token info
+            const tokenInfo = await getTokenInfo(mint);
+            if (!tokenInfo) {
+              log(`Couldn't get info for token mint ${mint}, skipping`, 'debug');
+              processedTokens.add(mint);
+              continue;
+            }
+            
+            // Get full token details including created_at
+            const fullDetails = await fetch(`https://lite-api.jup.ag/tokens/v1/token/${mint}`);
+            if (fullDetails.ok) {
+              const detailsData = await fullDetails.json() as any;
+              
+              if (DEBUG_MODE) {
+                log(`data: ${mint} ${JSON.stringify(detailsData, null, 2)}`, 'debug');
+              }
+              
+              // Add token to list with its details
+              tokenDetails.push({
+                token: tokenInfo,
+                created_at: detailsData.created_at || '',
+                mint
+              });
+            }
+          } catch (error) {
+            log(`Error processing token mint ${mint}: ${error}`, 'error');
+          }
+          
           // Add a small delay between requests to avoid rate limiting
           await new Promise(resolve => setTimeout(resolve, 500));
+        }
+        
+        // Sort tokens by creation date (newest first)
+        tokenDetails.sort((a, b) => {
+          // If created_at is missing for either token, put it at the end
+          if (!a.created_at) return 1;
+          if (!b.created_at) return -1;
+          
+          // Otherwise sort by date (descending)
+          return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+        });
+        
+        log(`Sorted ${tokenDetails.length} tokens by creation date (newest first)`, 'info');
+        
+        // Process sorted tokens
+        for (const { token } of tokenDetails) {
+          await enrichAndStore(token);
         }
       }
     } catch (err) {
