@@ -1,9 +1,15 @@
+version: "3.8"
+
 volumes:
   redis_data:
     driver: local
+  model_data:
+    driver: local
+  training_data:
+    driver: local
 
 networks:
-  internal:
+  market_network:
     driver: bridge
 
 services:
@@ -12,18 +18,45 @@ services:
     container_name: redis
     volumes:
       - redis_data:/data
-      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
     command: redis-server /usr/local/etc/redis/redis.conf
     networks:
-      - internal
+      - market_network
+    ports:
+      - "6379:6379"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
       retries: 5
+
+  ai_model:
+    build: 
+      context: ./ai_model
+      dockerfile: Dockerfile
+    container_name: ai_model
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./ai_model:/app
+      - model_data:/app/models
+      - training_data:/app/training_data
     ports:
-      - "6379:6379"
+      - "${AI_PORT:-8000}:${AI_PORT:-8000}"
+    environment:
+      - AI_PORT=${AI_PORT:-8000}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - TRAINING_DATA_PATH=/app/training_data/training_data.jsonl
+    networks:
+      - market_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   market_watcher:
     build: 
@@ -33,13 +66,38 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      ai_model:
+        condition: service_started
     environment:
       - REDIS_URL=${REDIS_URL:-redis://redis:6379}
       - JUPITER_API_URL=${JUPITER_API_URL:-https://quote-api.jup.ag/v6}
+      - AI_MODEL_URL=${AI_MODEL_URL:-http://ai_model:8000}
       - DEBUG_MODE=${DEBUG_MODE:-true}
+      - MIN_LIQUIDITY=${MIN_LIQUIDITY:-1}
+      - SEED_INTERVAL=${SEED_INTERVAL:-15000}
     volumes:
       - ./market_watcher:/app
       - /app/node_modules
     networks:
-      - internal
+      - market_network
     restart: unless-stopped
+
+  data_collector:
+    build: 
+      context: ./ai_model
+      dockerfile: Dockerfile
+    container_name: data_collector
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - TRAINING_DATA_PATH=/app/training_data/training_data.jsonl
+    volumes:
+      - ./ai_model:/app
+      - training_data:/app/training_data
+    networks:
+      - market_network
+    restart: unless-stopped
+    # Fixed command - removed duplicate python reference
+    command: python data_collector.py --schedule hourly --mode export
